@@ -1350,6 +1350,71 @@ function SecureRandom() {}
 SecureRandom.prototype.nextBytes = rng_get_bytes;
 
 // Depends on jsbn.js and rng.js
+// function linebrk(s,n) {
+//   var ret = "";
+//   var i = 0;
+//   while(i + n < s.length) {
+//     ret += s.substring(i,i+n) + "\n";
+//     i += n;
+//   }
+//   return ret + s.substring(i,s.length);
+// }
+// function byte2Hex(b) {
+//   if(b < 0x10)
+//     return "0" + b.toString(16);
+//   else
+//     return b.toString(16);
+// }
+function pkcs1pad1(s, n) {
+    if (n < s.length + 22) {
+        console.error("Message too long for RSA");
+        return null;
+    }
+    var len = n - s.length - 6;
+    var filler = "";
+    for (var f = 0; f < len; f += 2) {
+        filler += "ff";
+    }
+    var m = "0001" + filler + "00" + s;
+    return parseBigInt(m, 16);
+}
+// PKCS#1 (type 2, random) pad input string s to n bytes, and return a bigint
+function pkcs1pad2(s, n) {
+    if (n < s.length + 11) { // TODO: fix for utf-8
+        console.error("Message too long for RSA");
+        return null;
+    }
+    var ba = [];
+    var i = s.length - 1;
+    while (i >= 0 && n > 0) {
+        var c = s.charCodeAt(i--);
+        if (c < 128) { // encode using utf-8
+            ba[--n] = c;
+        }
+        else if ((c > 127) && (c < 2048)) {
+            ba[--n] = (c & 63) | 128;
+            ba[--n] = (c >> 6) | 192;
+        }
+        else {
+            ba[--n] = (c & 63) | 128;
+            ba[--n] = ((c >> 6) & 63) | 128;
+            ba[--n] = (c >> 12) | 224;
+        }
+    }
+    ba[--n] = 0;
+    var rng = new SecureRandom();
+    var x = [];
+    while (n > 2) { // random non-zero pad
+        x[0] = 0;
+        while (x[0] == 0) {
+            rng.nextBytes(x);
+        }
+        ba[--n] = x[0];
+    }
+    ba[--n] = 2;
+    ba[--n] = 0;
+    return new BigInteger(ba);
+}
 
 // Version 1.1: support utf-8 encoding in pkcs1pad2
 
@@ -1548,6 +1613,33 @@ function pkcs1unpad2(d,n) {
   return ret;
 }
 
+// https://tools.ietf.org/html/rfc3447#page-43
+var DIGEST_HEADERS = {
+    md2: "3020300c06082a864886f70d020205000410",
+    md5: "3020300c06082a864886f70d020505000410",
+    sha1: "3021300906052b0e03021a05000414",
+    sha224: "302d300d06096086480165030402040500041c",
+    sha256: "3031300d060960864801650304020105000420",
+    sha384: "3041300d060960864801650304020205000430",
+    sha512: "3051300d060960864801650304020305000440",
+    ripemd160: "3021300906052b2403020105000414",
+};
+function getDigestHeader(name) {
+    return DIGEST_HEADERS[name] || "";
+}
+function removeDigestHeader(str) {
+    for (var name_1 in DIGEST_HEADERS) {
+        if (DIGEST_HEADERS.hasOwnProperty(name_1)) {
+            var header = DIGEST_HEADERS[name_1];
+            var len = header.length;
+            if (str.substr(0, len) == header) {
+                return str.substr(len);
+            }
+        }
+    }
+    return str;
+}
+
 // PKCS#1 (OAEP) mask generation function
 function oaep_mgf1_str(seed, len) {
   var mask = '', i = 0;
@@ -1710,6 +1802,37 @@ function RSADecrypt(ctext, unpadFunction) {
   return unpadFunction(m, (this.n.bitLength()+7)>>3);
 }
 
+function RSAVerify(text, signature, digestMethod) {
+    var c = parseBigInt(signature, 16);
+    var m = this.doPublic(c);
+    if (m == null) {
+        return null;
+    }
+    var unpadded = m.toString(16).replace(/^1f+00/, "");
+    var digest = removeDigestHeader(unpadded);
+    return digest == digestMethod(text).toString();
+};
+
+function RSASign(text, digestMethod, digestName) {
+    var header = getDigestHeader(digestName);
+    var digest = header + digestMethod(text).toString();
+    var m = pkcs1pad1(digest, this.n.bitLength() / 4);
+    if (m == null) {
+        return null;
+    }
+    var c = this.doPrivate(m);
+    if (c == null) {
+        return null;
+    }
+    var h = c.toString(16);
+    if ((h.length & 1) == 0) {
+        return h;
+    }
+    else {
+        return "0" + h;
+    }
+};
+
 // Return the PKCS#1 RSA decryption of "ctext".
 // "ctext" is a Base64-encoded string and the output is a plain string.
 //function RSAB64Decrypt(ctext) {
@@ -1725,6 +1848,8 @@ RSAKey.prototype.setPrivate = RSASetPrivate;
 RSAKey.prototype.setPrivateEx = RSASetPrivateEx;
 RSAKey.prototype.generate = RSAGenerate;
 RSAKey.prototype.decrypt = RSADecrypt;
+RSAKey.prototype.verify = RSAVerify;
+RSAKey.prototype.sign = RSASign;
 //RSAKey.prototype.b64_decrypt = RSAB64Decrypt;
 
 // Copyright (c) 2011  Kevin M Burns Jr.
@@ -4750,6 +4875,42 @@ JSEncrypt.prototype.encrypt = function (string, use_oaep) {
   catch (ex) {
     return false;
   }
+};
+
+/**
+* Proxy method for RSAKey object's sign.
+* @param {string} str the string to sign
+* @param {function} digestMethod hash method
+* @param {string} digestName the name of the hash algorithm
+* @return {string} the signature encoded in base64
+* @public
+*/
+JSEncrypt.prototype.sign = function (str, digestMethod, digestName) {
+// return the RSA signature of 'str' in 'hex' format.
+try {
+    return hex2b64(this.getKey().sign(str, digestMethod, digestName));
+}
+catch (ex) {
+    return false;
+}
+};
+
+/**
+* Proxy method for RSAKey object's verify.
+* @param {string} str the string to verify
+* @param {string} signature the signature encoded in base64 to compare the string to
+* @param {function} digestMethod hash method
+* @return {boolean} whether the data and signature match
+* @public
+*/
+JSEncrypt.prototype.verify = function (str, signature, digestMethod) {
+// Return the decrypted 'digest' of the signature.
+try {
+    return this.getKey().verify(str, b64tohex(signature), digestMethod);
+}
+catch (ex) {
+    return false;
+}
 };
 
 /**
